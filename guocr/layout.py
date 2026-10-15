@@ -186,12 +186,15 @@ def _split_rows(items: list[Box], unit: float) -> list[Line]:
     """先按纵向重叠把文字框归成行；同一行里两个框隔得很远（> 1.3 个字高，正常词间距约 0.3 个字高）时切开，各成一条“行片段”。
     网页、幻灯片、表格里同一高度的左右两块内容（正文与侧栏、两个单元格）因此不会被拼成一句。"""
     out: list[Line] = []
+    lefts = [it[0] for it in items]
     for row in _group_lines_raw(items):
         segs = sorted(row, key=lambda it: it[0])
         h = median(s[3] - s[1] for s in segs)
         cur = [segs[0]]
         for s in segs[1:]:
-            if s[0] - cur[-1][2] > max(1.3 * h, 12):  # 与 ocr._split_wide_gaps 的门槛一致
+            gap = s[0] - cur[-1][2]
+            aligned = sum(abs(x - s[0]) <= 6 for x in lefts) >= 3  # 右边这块的左端与其他行对齐：另一栏的开头
+            if gap > max(1.3 * h, 12) or (gap > max(0.8 * h, 10) and aligned):  # 与 ocr._split_wide_gaps 一致
                 out.append(_make_line(cur))
                 cur = [s]
             else:
@@ -284,7 +287,8 @@ def _paragraphs(lines: list[Line]) -> list[Paragraph]:
         short_prev = width > 6 * h and _ended_early(prev, cur, local_right, h)
         # 注意：不用“框高变化”判断标题——OCR 给短行的框会明显偏高，容易误判；标题靠段距/短行就能分出来
         listed = bool(_LIST_START.match(cur.text))
-        if spaced or indented or short_prev or listed:
+        truncated = prev.text.rstrip().endswith(("...", "…"))  # 网页目录、列表里被截短的条目各自独立
+        if spaced or indented or short_prev or listed or truncated:
             paras.append(Paragraph([cur]))
         else:
             paras[-1].lines.append(cur)

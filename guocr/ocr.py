@@ -153,6 +153,11 @@ class OcrEngine:
             rects.append((int(box[:, 0].min()), int(box[:, 1].min()),
                           int(np.ceil(box[:, 0].max())), int(np.ceil(box[:, 1].max()))))
         med_h = float(np.median([r[3] - r[1] for r in rects])) if rects else 0
+        lefts = np.array([r[0] for r in rects])
+
+        def column_start(x: float) -> bool:
+            """x 处是否像另一栏的开头：至少还有两个文字框的左端与它对齐（网页侧栏、表格列）。"""
+            return int(np.sum(np.abs(lefts - x) <= 6)) >= 2
 
         def ink_mask(x0, y0, x1, y1):
             region = gray[max(y0, 0):y1, max(x0, 0):x1]
@@ -196,7 +201,10 @@ class OcrEngine:
                 ink = np.flatnonzero(cols)
                 if ink.size == 0:
                     continue
-                gaps = [(a, b) for a, b in runs(cols[ink[0]:ink[-1] + 1], False) if b - a >= max(1.3 * h, 12)]
+                # 空白宽于 1.3 个字高就切；宽于 0.8 个字高且右边的文字正好对齐到另一栏的开头也切
+                gaps = [(a, b) for a, b in runs(cols[ink[0]:ink[-1] + 1], False)
+                        if b - a >= max(1.3 * h, 12)
+                        or (b - a >= max(0.8 * h, 10) and column_start(px0 + ink[0] + b))]
                 edges = [ink[0]] + [ink[0] + v for a, b in gaps for v in (a, b)] + [ink[-1] + 1]
                 for a, b in zip(edges[::2], edges[1::2]):
                     final.append((px0 + a - 2, py0, px0 + b + 2, py1))
