@@ -74,6 +74,7 @@ class App(QObject):
             self.menu_actions[action] = self.menu.addAction(
                 ACTION_NAMES[action], lambda a=action: QTimer.singleShot(150, lambda: self.start_capture(a)))
         self.menu.addSeparator()
+        self.menu.addAction("翻译语境…", self.open_context)
         self.menu.addAction("设置…", self.open_settings)
         self.menu.addSeparator()
         self.menu.addAction("退出", self.quit)
@@ -303,6 +304,19 @@ class App(QObject):
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             QTimer.singleShot(150, lambda: self.start_capture("ocr"))
+
+    def open_context(self) -> None:
+        """翻译语境：用自然语言告诉本地大模型语境和词义，存成预设。"""
+        from .contextdlg import ContextDialog
+        if getattr(self, "context_dlg", None) is not None and self.context_dlg.isVisible():
+            self.context_dlg.raise_()
+            self.context_dlg.activateWindow()
+            return
+        self.context_dlg = ContextDialog()
+        self.context_dlg.setWindowIcon(self.icon)
+        self.context_dlg.show()
+        self.context_dlg.raise_()
+        self.context_dlg.activateWindow()
 
     def open_settings(self) -> None:
         if self.settings_dlg is not None:

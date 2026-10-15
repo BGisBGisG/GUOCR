@@ -103,6 +103,10 @@ def _translate_paragraphs(lines: list[str], timeout: float, engine: str) -> list
     global _online_down_until
     tl = target_language("\n".join(lines))
     names = ENGINES.get(engine, ENGINES["auto"])[1]
+    from . import context
+    if engine == "auto" and context.active_preset() is not None and offline_ready():
+        # 用户设了翻译语境：Google 用不上这些说明，优先用本地大模型
+        names = ("_via_llm",) + tuple(n for n in names if n != "_via_llm")
     if engine == "auto" and time.monotonic() < _online_down_until:
         names = [n for n in names if n not in _ONLINE]
     error: Exception | None = None
@@ -368,11 +372,11 @@ class _LlamaServer:
                 raise RuntimeError(r"离线翻译引擎启动失败，详见 %APPDATA%\GUOCR\llama-server.log")
             log.info("离线翻译引擎已启动：%s", self.device)
 
-    def chat(self, system: str, text: str) -> str:
+    def chat(self, system: str, text: str, extra: dict | None = None) -> str:
         import json
         self.ensure()
         body = json.dumps({"messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-                           "temperature": 0, "max_tokens": len(text) * 2 + 64}).encode()
+                           "temperature": 0, "max_tokens": len(text) * 2 + 64, **(extra or {})}).encode()
         req = urllib.request.Request(f"http://127.0.0.1:{self._port}/v1/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as r:
@@ -386,6 +390,20 @@ class _LlamaServer:
 
 
 _server = _LlamaServer()
+
+
+def chat_json(system: str, user: str, schema: dict, max_tokens: int = 800) -> str:
+    """让本地大模型按 JSON Schema 输出（llama-server 按语法约束生成，保证格式正确），返回 JSON 字符串。"""
+    import json
+    _server.ensure()
+    body = json.dumps({"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                       "temperature": 0, "max_tokens": max_tokens,
+                       "response_format": {"type": "json_schema", "json_schema": {"name": "result", "schema": schema}}}
+                      ).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{_server._port}/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
 
 
 def preload_llm() -> None:
@@ -438,6 +456,10 @@ def _via_llm(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: A
         # 术语放进系统提示；正文只放原文，否则小模型容易被提示格式带偏
         system = _LLM_SYSTEM if not hints else (
             _LLM_SYSTEM + "\n下列术语请使用指定译名：" + "；".join(f"{en} → {zh}" for en, zh in hints.items()) + "。")
+        from . import context
+        extra = context.prompt_for(text)  # 用户设定的翻译语境（当前预设）
+        if extra:
+            system += "\n" + extra
         zh = _llm_once(system, text)
         if hints and _leftover_english(text, zh):
             # 术语一多，3B 小模型偶尔会夹带英文原词；去掉术语提示重翻一次，通顺优先

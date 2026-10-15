@@ -178,7 +178,10 @@ class ResultWindow(QWidget):
         else:
             self.target.set_text(text)
             self.picture.set_image(image, "")
-            self.status.setText("译文已覆盖在原位（右键可复制/另存，双击关闭）；剪贴板：图片+译文")
+            from . import context
+            p = context.active_preset()
+            self.status.setText("译文已覆盖在原位（右键可复制/另存，双击关闭）；剪贴板：图片+译文"
+                                + (f"；语境：{p.name}" if p else ""))
         self._ensure_visible()
 
     def show_translation_progress(self, text: str, done: int, total: int) -> None:
