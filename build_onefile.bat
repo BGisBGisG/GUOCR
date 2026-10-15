@@ -15,11 +15,6 @@ if errorlevel 1 (
 )
 echo.
 echo 打包完成：dist_onefile\GUOCR.exe（单个文件，可直接拷到任何 64 位 Windows 上运行）
-rem 同步一份到 OneDrive（用户要求每次打包后都更新这里）
-set "SYNC_DIR=%USERPROFILE%\OneDrive - University of Georgia\Beikang Gu"
-if exist "%SYNC_DIR%\" (
-    copy /y "dist_onefile\GUOCR.exe" "%SYNC_DIR%\GUOCR.exe" >nul && echo 已更新：%SYNC_DIR%\GUOCR.exe
-)
 exit /b 0
 
 :fail
