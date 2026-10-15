@@ -95,12 +95,92 @@ def _wrap(text: str, fm: QFontMetricsF, width: float, first_indent: float = 0.0)
     return lines
 
 
+def _blocks(styles: list) -> list[list]:
+    """把一段的各行（阅读顺序）拆成屏幕上连续的块：换页/换栏（下一行跑到上面去了、或与上一行横向不重叠）
+    或行间距过大时另起一块。每块单独排版，跨页、跨栏的段落就不会被画成一个横跨几页的大框。"""
+    blocks: list[list] = []
+    for st in styles:
+        ink = st[2]
+        if blocks:
+            prev = blocks[-1][-1][2]
+            h = max(prev[3] - prev[1], ink[3] - ink[1], 6)
+            overlap = min(prev[2], ink[2]) - max(prev[0], ink[0])
+            if ink[1] < prev[1] or ink[1] - prev[3] > 2.5 * h or overlap < 0.3 * min(prev[2] - prev[0], ink[2] - ink[0]):
+                blocks.append([st])
+                continue
+            blocks[-1].append(st)
+        else:
+            blocks.append([st])
+    return blocks
+
+
+def _split_text(text: str, weights: list[float]) -> list[str]:
+    """按各块容量（行宽之和）把译文切成几份，尽量切在标点或空格处。"""
+    if len(weights) == 1:
+        return [text]
+    total = sum(weights) or 1
+    parts, start, acc = [], 0, 0.0
+    for w in weights[:-1]:
+        acc += w
+        cut = round(len(text) * acc / total)
+        best = cut
+        for d in range(0, 12):  # 往前后找最近的断点
+            for k in (cut + d, cut - d):
+                if start < k < len(text) and text[k - 1] in "，。；：、！？,.;: ）)":
+                    best = k
+                    break
+            else:
+                continue
+            break
+        best = min(max(best, start), len(text))
+        parts.append(text[start:best])
+        start = best
+    parts.append(text[start:])
+    return parts
+
+
+def _draw_block(p: QPainter, block: list, text: str, indent_first: bool, W: int) -> None:
+    """在一块（若干连续行）的区域内排版一段译文：字号从原文字高开始，放不下就缩小；
+    缩到 70% 仍放不下时继续往下排（单行块也会折行，而不是挤成一行小字）。"""
+    if not text:
+        return
+    bg, fg = block[0][0], block[0][1]
+    inks = [s[2] for s in block]
+    ink_h = max(sorted(i[3] - i[1] for i in inks)[len(inks) // 2], 6)
+    left = min(i[0] for i in inks[1:]) if len(inks) > 1 else inks[0][0]
+    indent = max(inks[0][0] - left, 0) if indent_first else 0
+    right = max(max(s[3] for s in block), left + 4 * ink_h)
+    top = inks[0][1] - ink_h * 0.2
+    bottom = inks[-1][3] + ink_h * 0.2
+    pitch = (inks[-1][1] - inks[0][1]) / (len(inks) - 1) if len(inks) > 1 else ink_h * 1.5
+
+    font = QFont(FONT_FAMILY)
+    start = max(ink_h * 1.05, 8.0)
+    size = start
+    while True:
+        font.setPixelSize(int(size))
+        fm = QFontMetricsF(font)
+        step = max(pitch * size / start, size * 1.2)
+        rows = _wrap(text, fm, right - left, indent)
+        if len(rows) * step <= bottom - top + step * 0.3 or size <= start * 0.7 or size <= 8:
+            break
+        size -= 0.5
+    text_h = len(rows) * step
+    p.fillRect(QRectF(left - 1, top, right - left + 2, max(bottom - top, text_h)), bg)  # 放不下时向下多铺一块背景
+    p.setFont(font)
+    p.setPen(fg)
+    flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine
+    y = top if len(inks) > 1 or len(rows) > 1 else (inks[0][1] + inks[0][3]) / 2 - step / 2
+    for i, row in enumerate(rows):
+        x = left + (indent if i == 0 else 0)
+        p.drawText(QRectF(x, y + i * step, W - x, step), flags, row)
+
+
 def render_translation(image: QImage, pairs) -> QImage:
     """把译文按段落贴回原文位置：先用背景色抹掉原文各行，再在原段落区域内重新排版译文。
 
-    pairs: [(layout.Paragraph, 译文), ...]，坐标为图片像素。
-    字号从原文字高开始，放不下就逐步缩小；缩到原来的 55% 仍放不下时向下延伸。
-    单行段落（按钮、标签等）不折行，太长时缩小字号或向右延伸。
+    pairs: [(layout.Paragraph, 译文), ...]，坐标为图片像素。段落的行若分布在几页/几栏，
+    拆成几块分别排版，译文按各块容量分配；字号从原文字高开始，放不下就缩小，再放不下就往下排。
     """
     out = image.convertToFormat(QImage.Format.Format_RGB32)
     out.setDevicePixelRatio(1.0)
@@ -123,42 +203,9 @@ def render_translation(image: QImage, pairs) -> QImage:
             styles.append((bg, fg, ink, x1))
         if not styles:
             continue
-        bg, fg = styles[0][0], styles[0][1]
-        inks = [s[2] for s in styles]
-        ink_h = max(sorted(i[3] - i[1] for i in inks)[len(inks) // 2], 6)
-        left = min(i[0] for i in inks[1:]) if len(inks) > 1 else inks[0][0]
-        indent = max(inks[0][0] - left, 0)
-        right = max(s[3] for s in styles)
-        top = inks[0][1] - ink_h * 0.2
-        bottom = inks[-1][3] + ink_h * 0.2
-        pitch = (inks[-1][1] - inks[0][1]) / (len(inks) - 1) if len(inks) > 1 else ink_h * 1.5
-
-        font = QFont(FONT_FAMILY)
-        start = max(ink_h * 1.05, 8.0)
-        size = start
-        while True:
-            font.setPixelSize(int(size))
-            fm = QFontMetricsF(font)
-            step = max(pitch * size / start, size * 1.2)
-            if len(inks) == 1:
-                rows = [dst]
-                fits = fm.horizontalAdvance(dst) <= right - left + ink_h
-            else:
-                rows = _wrap(dst, fm, right - left, indent)
-                fits = len(rows) * step <= bottom - top + step * 0.3
-            if fits or size <= start * 0.55 or size <= 8:
-                break
-            size -= 0.5
-        text_h = len(rows) * step
-        text_w = max(fm.horizontalAdvance(r) for r in rows) + (indent if len(rows) == 1 else 0)
-        # 实在放不下：单行向右、多行向下扩一块背景
-        p.fillRect(QRectF(left - 1, top, max(right - left, text_w) + 2, max(bottom - top, text_h)), bg)
-        p.setFont(font)
-        p.setPen(fg)
-        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine
-        y = top if len(inks) > 1 else (inks[0][1] + inks[0][3]) / 2 - step / 2
-        for i, row in enumerate(rows):
-            x = left + (indent if i == 0 else 0)
-            p.drawText(QRectF(x, y + i * step, W - x, step), flags, row)
+        blocks = _blocks(styles)
+        weights = [sum(max(s[3] - s[2][0], 1) for s in b) for b in blocks]
+        for k, (block, part) in enumerate(zip(blocks, _split_text(dst, weights))):
+            _draw_block(p, block, part.strip(), k == 0, W)
     p.end()
     return out

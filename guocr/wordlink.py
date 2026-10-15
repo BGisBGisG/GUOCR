@@ -302,21 +302,71 @@ def refine(paras: list[Paragraph], regions: list[tuple[int, int, int, int]], cen
     m = re.match(r"[^\s\r]*", raw[end:])
     end += len(m.group()) if m else 0
 
-    # 按 Word 的段落标记（\r）切段，去掉已删除的修订文字；每段挂上对应的 OCR 行（屏幕位置）
-    out: list[Paragraph] = []
+    # 按 Word 的段落标记（\r）切段，去掉已删除的修订文字
+    def build_text(a: int, b: int) -> str:
+        """原文 raw[a:b] → 段落文字：去掉已删除的修订、控制字符，数学字母转普通字母，规整空白。"""
+        text = "".join(raw[i] for i in range(a, b) if not is_deleted[i])
+        text = _clean(text)
+        text = "".join(unicodedata.normalize("NFKC", c) if _is_math_char(c) else c for c in text)  # 𝑅 → R
+        return "\t".join(re.sub(r" +", " ", cell).strip() for cell in text.split("\t")).strip()
+
+    pieces = []  # [(原文中的起点, 终点, 段落文字)]
     pos = start
     for piece in re.split(r"(\r)", raw[start:end]):
         if piece == "\r":
             pos += 1
             continue
-        text = "".join(c for k, c in enumerate(piece) if not is_deleted[pos + k])
-        text = _clean(text)
-        text = "".join(unicodedata.normalize("NFKC", c) if _is_math_char(c) else c for c in text)  # 𝑅 → R
-        text = "\t".join(re.sub(r" +", " ", cell).strip() for cell in text.split("\t")).strip()
-        p_lines = [lines[li] for li, (cs, ce) in sorted(line_span.items())
-                   if pos <= (cs + ce) / 2 < pos + len(piece) + 1]
+        pieces.append((pos, pos + len(piece) + 1, build_text(pos, pos + len(piece))))
         pos += len(piece)
+
+    # 每一条 OCR 行都要归到某个段落（屏幕位置用于贴译文）。对上了原文的行按其位置归段；
+    # 没对上的行（字太小识别错）按前后最近的已归段行推断：前后同属一段就归那段；否则看识别时
+    # 版面分析把它和哪些行分在同一段，跟随其中已归段的行；都没有就跟随前一行。
+    def piece_of(li):
+        cs, ce = line_span[li]
+        mid = (cs + ce) / 2
+        return next((k for k, (a, b, _) in enumerate(pieces) if a <= mid < b), None)
+
+    owner_par = {li: piece_of(li) for li in line_span}
+    ocr_par = [pi for pi, p in enumerate(paras) for _ in p.lines]  # 每条行在识别版面分析中的段号
+    assigned: list[int | None] = []
+    for li in range(len(lines)):
+        k = owner_par.get(li)
+        if k is None:
+            prev = next((owner_par[j] for j in range(li - 1, -1, -1) if owner_par.get(j) is not None), None)
+            nxt = next((owner_par[j] for j in range(li + 1, len(lines)) if owner_par.get(j) is not None), None)
+            same = [owner_par[j] for j in range(len(lines))
+                    if ocr_par[j] == ocr_par[li] and owner_par.get(j) is not None]
+            if prev is not None and prev == nxt:
+                k = prev
+            elif same:
+                k = max(set(same), key=same.count)
+            else:
+                k = prev if prev is not None else nxt
+        assigned.append(k)
+
+    out: list[Paragraph] = []
+    for k, (a, b, text) in enumerate(pieces):
+        idx = [li for li in range(len(lines)) if assigned[li] == k]
+        if not idx:  # 屏幕上一行都看不到（只是取原文时多取的范围）：不输出
+            continue
+        # 只截到一段的一部分时（屏幕边缘、上一排页面只露出底部等），只保留看得见的那几行对应的原文：
+        # 以对上原文的行为准，首尾各留出“未对上的行数 + 1”行的余量，再对齐到词边界
+        spans = [line_span[li] for li in idx if li in line_span]
+        if spans:
+            cpl = sorted(ce - cs for cs, ce in spans)[len(spans) // 2] * 1.3  # 每行大约多少字符
+            m0 = idx.index(next(li for li in idx if li in line_span))
+            m1 = len(idx) - 1 - idx[::-1].index(next(li for li in reversed(idx) if li in line_span))
+            lo = min(cs for cs, _ in spans) - (m0 + 1) * cpl
+            hi = max(ce for _, ce in spans) + (m1 + 1) * cpl
+            a2, b2 = max(a, int(lo)), min(b - 1, int(hi))
+            if a2 > a:
+                a2 = a2 + len(re.match(r"\S*", raw[a2:b]).group())  # 从下一个词开始，不截半个词
+            if b2 < b - 1:
+                b2 = b2 + len(re.match(r"\S*", raw[b2:b]).group())
+            if (a2, b2) != (a, b - 1):
+                text = build_text(a2, b2)
         if re.search(r"\w", text):  # 只有符号（如图片占位的“/”）的不算一段
-            out.append(Paragraph(p_lines, override=text))
+            out.append(Paragraph([lines[li] for li in idx], override=text))
     log.info("已用 Word 原文校正：%d 段（识别词与原文对齐 %d/%d）", len(out), matched, len(ocr_words))
     return out or None
