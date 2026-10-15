@@ -1,0 +1,9 @@
+PySide6-Essentials>=6.6
+rapidocr>=3.0,<4
+# DirectML build: OCR runs on any DX12 GPU (NVIDIA/AMD/Intel), falls back to CPU
+onnxruntime-directml>=1.18
+numpy
+ctranslate2>=4.0
+sentencepiece
+# read the original text directly from Word (COM) when capturing a Word window
+pywin32

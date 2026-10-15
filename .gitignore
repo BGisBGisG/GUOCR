@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+__pycache__/
+build/*.spec
+models/
+dist_onefile/
+dist_slim/
+GUOCR.spec
+dist_onefile_new/
