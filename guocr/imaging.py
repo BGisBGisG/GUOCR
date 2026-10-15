@@ -139,7 +139,7 @@ def _split_text(text: str, weights: list[float]) -> list[str]:
     return parts
 
 
-def _draw_block(p: QPainter, block: list, text: str, indent_first: bool, W: int) -> None:
+def _draw_block(p: QPainter, block: list, text: str, indent_first: bool, W: int, cap: float = 1e9) -> None:
     """在一块（若干连续行）的区域内排版一段译文：字号从原文字高开始，放不下就缩小；
     缩到 70% 仍放不下时继续往下排（单行块也会折行，而不是挤成一行小字）。"""
     if not text:
@@ -155,7 +155,7 @@ def _draw_block(p: QPainter, block: list, text: str, indent_first: bool, W: int)
     pitch = (inks[-1][1] - inks[0][1]) / (len(inks) - 1) if len(inks) > 1 else ink_h * 1.5
 
     font = QFont(FONT_FAMILY)
-    start = max(ink_h * 1.05, 8.0)
+    start = max(min(ink_h * 1.05, cap), 8.0)  # cap：防止个别异常高的行（如两行被检测成一个框）把字放得很大
     size = start
     while True:
         font.setPixelSize(int(size))
@@ -189,6 +189,8 @@ def render_translation(image: QImage, pairs) -> QImage:
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    heights = sorted(ln.h for para, _ in pairs for ln in para.lines)
+    cap = 1.4 * heights[len(heights) // 2] if heights else 1e9  # 字号上限：整张截图普通行高的 1.4 倍
     for para, dst in pairs:
         if not dst:
             continue
@@ -206,6 +208,6 @@ def render_translation(image: QImage, pairs) -> QImage:
         blocks = _blocks(styles)
         weights = [sum(max(s[3] - s[2][0], 1) for s in b) for b in blocks]
         for k, (block, part) in enumerate(zip(blocks, _split_text(dst, weights))):
-            _draw_block(p, block, part.strip(), k == 0, W)
+            _draw_block(p, block, part.strip(), k == 0, W, cap)
     p.end()
     return out

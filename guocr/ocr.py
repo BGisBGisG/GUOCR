@@ -140,42 +140,71 @@ class OcrEngine:
         return paras
 
     def _split_wide_gaps(self, img: np.ndarray, boxes, txts) -> list[tuple[float, float, float, float, str]]:
-        """文字检测会把同一高度、只隔一两个字宽的两块内容（网页正文与侧栏、表格相邻单元格）连成一个框，
-        识别时空白也被吞掉（“Pages 28” + “remain” → “28rémain”）。这里按像素找出框内宽于 1.3 个字高的
-        空白列（正常词间距约 0.3 个字高），在那里切开，各段单独重新识别。"""
+        """修正文字检测把不该连在一起的内容连成一个框：
+        - 行距很紧时，上下两行可能被检测成一个框（高度约为普通行的两倍）：按框内的整行空白切成多行；
+        - 同一高度、只隔一两个字宽的两块内容（网页正文与侧栏、表格相邻单元格）连成一个框，识别时空白也被吞掉
+          （“Pages 28” + “remain” → “28rémain”）：按框内宽于 1.3 个字高的空白列切开（正常词间距约 0.3 个字高）。
+        切开的各段单独重新识别。"""
         from rapidocr.ch_ppocr_rec.typings import TextRecInput
-        out, pending = [], []  # pending: 待重新识别的 (x0, y0, x1, y1, 图像)
         gray = img.mean(axis=2)
-        for box, txt in zip(boxes, txts):
+        rects = []
+        for box in boxes:
             box = np.asarray(box)
-            x0, y0 = int(box[:, 0].min()), int(box[:, 1].min())
-            x1, y1 = int(np.ceil(box[:, 0].max())), int(np.ceil(box[:, 1].max()))
-            h = y1 - y0
+            rects.append((int(box[:, 0].min()), int(box[:, 1].min()),
+                          int(np.ceil(box[:, 0].max())), int(np.ceil(box[:, 1].max()))))
+        med_h = float(np.median([r[3] - r[1] for r in rects])) if rects else 0
+
+        def ink_mask(x0, y0, x1, y1):
             region = gray[max(y0, 0):y1, max(x0, 0):x1]
-            if h < 6 or region.size == 0 or (x1 - x0) < 4 * h:
-                out.append((x0, y0, x1, y1, txt))
+            if region.size == 0:
+                return None
+            bg = np.median(np.concatenate([region[0], region[-1], region[:, 0], region[:, -1]]))
+            return np.abs(region - bg) > 40
+
+        def runs(flags: np.ndarray, value: bool):
+            """flags 中连续等于 value 的区间 [(起, 止)]。"""
+            out_, start = [], None
+            for i, f in enumerate(flags):
+                if f == value and start is None:
+                    start = i
+                elif f != value and start is not None:
+                    out_.append((start, i))
+                    start = None
+            if start is not None:
+                out_.append((start, len(flags)))
+            return out_
+
+        out, pending = [], []  # pending: 待重新识别的 (x0, y0, x1, y1, 图像)
+        for (x0, y0, x1, y1), txt in zip(rects, txts):
+            pieces = [(x0, y0, x1, y1)]
+            # ① 异常高的框：按整行空白切成多行
+            if med_h and y1 - y0 > 1.6 * med_h:
+                m = ink_mask(x0, y0, x1, y1)
+                if m is not None:
+                    bands = [(a, b) for a, b in runs(m.any(axis=1), True) if b - a >= 0.3 * med_h]
+                    if len(bands) >= 2:
+                        pieces = [(x0, y0 + a - 1, x1, y0 + b + 1) for a, b in bands]
+            # ② 每一行：按宽空白列切开
+            final = []
+            for px0, py0, px1, py1 in pieces:
+                h = py1 - py0
+                m = ink_mask(px0, py0, px1, py1)
+                if h < 6 or m is None or (px1 - px0) < 4 * h:
+                    final.append((px0, py0, px1, py1))
+                    continue
+                cols = m.any(axis=0)
+                ink = np.flatnonzero(cols)
+                if ink.size == 0:
+                    continue
+                gaps = [(a, b) for a, b in runs(cols[ink[0]:ink[-1] + 1], False) if b - a >= max(1.3 * h, 12)]
+                edges = [ink[0]] + [ink[0] + v for a, b in gaps for v in (a, b)] + [ink[-1] + 1]
+                for a, b in zip(edges[::2], edges[1::2]):
+                    final.append((px0 + a - 2, py0, px0 + b + 2, py1))
+            if final == [(x0, y0, x1, y1)] or (len(final) == 1 and len(pieces) == 1):
+                out.append((x0, y0, x1, y1, txt))  # 没有切开：沿用原识别结果
                 continue
-            bg = np.median(np.concatenate([region[0], region[-1]]))
-            cols = (np.abs(region - bg) > 40).any(axis=0)  # 这一列有没有笔画
-            ink = np.flatnonzero(cols)
-            if ink.size == 0:
-                out.append((x0, y0, x1, y1, txt))
-                continue
-            cuts, run_start = [], None
-            for c in range(ink[0], ink[-1] + 1):
-                if not cols[c]:
-                    run_start = c if run_start is None else run_start
-                elif run_start is not None:
-                    if c - run_start >= max(1.3 * h, 12):
-                        cuts.append((run_start, c))
-                    run_start = None
-            if not cuts:
-                out.append((x0, y0, x1, y1, txt))
-                continue
-            edges = [ink[0]] + [v for a, b in cuts for v in (a, b)] + [ink[-1] + 1]
-            for a, b in zip(edges[::2], edges[1::2]):
-                sx0, sx1 = x0 + a - 2, x0 + b + 2
-                pending.append((sx0, y0, sx1, y1, img[max(y0, 0):y1, max(sx0, 0):sx1]))
+            for fx0, fy0, fx1, fy1 in final:
+                pending.append((fx0, fy0, fx1, fy1, img[max(fy0, 0):fy1, max(fx0, 0):fx1]))
         if pending:
             rec = self._engine.text_rec(TextRecInput(img=[p[4] for p in pending]))
             for (sx0, sy0, sx1, sy1, _), t in zip(pending, rec.txts):
