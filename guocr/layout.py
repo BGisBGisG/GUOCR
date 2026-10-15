@@ -153,7 +153,17 @@ def _xy_cut(items: list[Box], unit: float, depth: int = 0) -> list[list[Box]]:
 
 
 # ------------------------------------------------------------------ 分行、分段
+def _make_line(segs: list[Box]) -> Line:
+    return Line(min(s[0] for s in segs), min(s[1] for s in segs),
+                max(s[2] for s in segs), max(s[3] for s in segs), join_segments(segs))
+
+
 def _group_lines(items: list[Box]) -> list[Line]:
+    return [_make_line(sorted(row, key=lambda it: it[0])) for row in _group_lines_raw(items)]
+
+
+def _group_lines_raw(items: list[Box]) -> list[list[Box]]:
+    """按纵向重叠把文字框归成行，返回各行的文字框（未排序）。"""
     items = sorted(items, key=lambda it: (it[1] + it[3]) / 2)
     rows: list[dict] = []
     for it in items:
@@ -168,12 +178,66 @@ def _group_lines(items: list[Box]) -> list[Line]:
                 row["bottom"] += (y1 - row["bottom"]) / n
                 continue
         rows.append({"top": y0, "bottom": y1, "items": [it]})
-    lines = []
-    for row in rows:
-        segs = sorted(row["items"], key=lambda it: it[0])
-        lines.append(Line(min(s[0] for s in segs), min(s[1] for s in segs),
-                          max(s[2] for s in segs), max(s[3] for s in segs), join_segments(segs)))
-    return lines
+    return [row["items"] for row in rows]
+
+
+# ------------------------------------------------------------------ 分区（区块）
+def _split_rows(items: list[Box], unit: float) -> list[Line]:
+    """先按纵向重叠把文字框归成行；同一行里两个框隔得很远（> 1.3 个字高，正常词间距约 0.3 个字高）时切开，各成一条“行片段”。
+    网页、幻灯片、表格里同一高度的左右两块内容（正文与侧栏、两个单元格）因此不会被拼成一句。"""
+    out: list[Line] = []
+    for row in _group_lines_raw(items):
+        segs = sorted(row, key=lambda it: it[0])
+        h = median(s[3] - s[1] for s in segs)
+        cur = [segs[0]]
+        for s in segs[1:]:
+            if s[0] - cur[-1][2] > max(1.3 * h, 12):  # 与 ocr._split_wide_gaps 的门槛一致
+                out.append(_make_line(cur))
+                cur = [s]
+            else:
+                cur.append(s)
+        out.append(_make_line(cur))
+    return out
+
+
+def _link_blocks(lines: list[Line], unit: float) -> list[list[Line]]:
+    """把上下相邻、左右对齐的行连成区块（一个正文段落组、一列目录、一段图注……）。
+    下一行要接在某块后面，需要：与该块最后一行的纵向间距不超过 1.8 个字高，横向有足够重叠；
+    有多个候选时选左边缘最对齐的那块。"""
+    blocks: list[list[Line]] = []
+    for ln in sorted(lines, key=lambda l_: (l_.y0, l_.x0)):
+        h = max(ln.h, 0.6 * unit)
+        best, best_score = None, None
+        for b in blocks:
+            last = b[-1]
+            gap = ln.y0 - last.y1
+            if gap < -0.3 * h or gap > 1.8 * max(h, last.h):
+                continue
+            overlap = min(ln.x1, last.x1) - max(ln.x0, last.x0)
+            if overlap < 0.5 * min(ln.x1 - ln.x0, last.x1 - last.x0):
+                continue
+            score = abs(ln.x0 - last.x0) + 0.2 * gap
+            if best is None or score < best_score:
+                best, best_score = b, score
+        if best is None:
+            blocks.append([ln])
+        else:
+            best.append(ln)
+    return blocks
+
+
+def _order_blocks(blocks: list[list[Line]], unit: float) -> list[list[Line]]:
+    """区块的阅读顺序：先对区块外接框做 XY-cut（能切出贯通的竖向空白就先左栏后右栏，如报纸、论文的分栏），
+    切不开的部分按上沿从上到下、同高时从左到右。"""
+    boxes: list[Box] = []
+    for i, b in enumerate(blocks):
+        boxes.append((min(l_.x0 for l_ in b), min(l_.y0 for l_ in b), max(l_.x1 for l_ in b),
+                      max(l_.y1 for l_ in b), str(i)))
+    ordered: list[list[Line]] = []
+    for leaf in _xy_cut(boxes, unit):
+        for bx in sorted(leaf, key=lambda r: (round(r[1] / max(unit, 1)), r[0])):
+            ordered.append(blocks[int(bx[4])])
+    return ordered
 
 
 _LIST_START = re.compile(r"^\s*([•·▪●○■□◆◇►▶✓✔\-–—*]\s|\d{1,3}[.、)）]\s*\S|[（(]\d{1,3}[)）]|"
@@ -207,14 +271,17 @@ def _paragraphs(lines: list[Line]) -> list[Paragraph]:
     pitch = median(pitches) if len(pitches) >= 2 else None
 
     paras = [Paragraph([lines[0]])]
-    for prev, cur in zip(lines, lines[1:]):
+    for i, (prev, cur) in enumerate(zip(lines, lines[1:])):
         step = cur.cy - prev.cy
         if pitch is not None:
             spaced = step > 1.35 * pitch and step - pitch > 0.25 * h
         else:
             spaced = cur.y0 - prev.y1 > 0.9 * h
         indented = cur.x0 - left > 1.2 * h and prev.x0 - left < 0.6 * h
-        short_prev = width > 6 * h and _ended_early(prev, cur, right, h)
+        # 右边界取附近几行（前后各 3 行）的最右端：区块里若有一行特别长（如作者名单、网址），
+        # 用整块的最右端会让正常折行的行看起来“没写满”而被误判为段尾
+        local_right = max(ln.x1 for ln in lines[max(0, i - 3):i + 5])
+        short_prev = width > 6 * h and _ended_early(prev, cur, local_right, h)
         # 注意：不用“框高变化”判断标题——OCR 给短行的框会明显偏高，容易误判；标题靠段距/短行就能分出来
         listed = bool(_LIST_START.match(cur.text))
         if spaced or indented or short_prev or listed:
@@ -273,9 +340,10 @@ def analyze(items: list[Box], pages: list[tuple[int, int, int, int]] | None = No
         groups = [g for g in groups if g] + ([rest] if rest else [])
     paras: list[Paragraph] = []
     for g in groups:
+        # 分区：行片段 → 区块 → 阅读顺序；每个区块内再分段
         page_paras: list[Paragraph] = []
-        for block in _xy_cut(g, unit):
-            page_paras.extend(_paragraphs(_group_lines(block)))
+        for block in _order_blocks(_link_blocks(_split_rows(g, unit), unit), unit):
+            page_paras.extend(_paragraphs(sorted(block, key=lambda l_: l_.y0)))
         if paras and page_paras and len(groups) > 1 and _continues(paras[-1], page_paras[0]):
             paras[-1].lines.extend(page_paras.pop(0).lines)
         paras.extend(page_paras)

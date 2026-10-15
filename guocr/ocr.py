@@ -115,14 +115,13 @@ class OcrEngine:
         """识别并做版面分析，返回按阅读顺序排列的段落（坐标为原图像素，已去掉补边）。
 
         origin：截图左上角的屏幕物理坐标。给出时若截图区域在 Word 窗口上，会改用 Word 里的原文（见 wordlink）。"""
-        result = self._engine(_pad(img))
+        padded = _pad(img)
+        result = self._engine(padded)
         if result.boxes is None or not result.txts:
             return []
         items = []
-        for box, txt in zip(result.boxes, result.txts):
-            box = np.asarray(box)
-            items.append((float(box[:, 0].min()) - PAD, float(box[:, 1].min()) - PAD,
-                          float(box[:, 0].max()) - PAD, float(box[:, 1].max()) - PAD, clean_marks(txt.strip())))
+        for x0, y0, x1, y1, txt in self._split_wide_gaps(padded, result.boxes, result.txts):
+            items.append((x0 - PAD, y0 - PAD, x1 - PAD, y1 - PAD, clean_marks(txt.strip())))
         pages = detect_pages(img)
         paras = analyze(items, pages)
         if origin is not None and paras:
@@ -139,6 +138,50 @@ class OcrEngine:
             if exact:
                 return exact
         return paras
+
+    def _split_wide_gaps(self, img: np.ndarray, boxes, txts) -> list[tuple[float, float, float, float, str]]:
+        """文字检测会把同一高度、只隔一两个字宽的两块内容（网页正文与侧栏、表格相邻单元格）连成一个框，
+        识别时空白也被吞掉（“Pages 28” + “remain” → “28rémain”）。这里按像素找出框内宽于 1.3 个字高的
+        空白列（正常词间距约 0.3 个字高），在那里切开，各段单独重新识别。"""
+        from rapidocr.ch_ppocr_rec.typings import TextRecInput
+        out, pending = [], []  # pending: 待重新识别的 (x0, y0, x1, y1, 图像)
+        gray = img.mean(axis=2)
+        for box, txt in zip(boxes, txts):
+            box = np.asarray(box)
+            x0, y0 = int(box[:, 0].min()), int(box[:, 1].min())
+            x1, y1 = int(np.ceil(box[:, 0].max())), int(np.ceil(box[:, 1].max()))
+            h = y1 - y0
+            region = gray[max(y0, 0):y1, max(x0, 0):x1]
+            if h < 6 or region.size == 0 or (x1 - x0) < 4 * h:
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            bg = np.median(np.concatenate([region[0], region[-1]]))
+            cols = (np.abs(region - bg) > 40).any(axis=0)  # 这一列有没有笔画
+            ink = np.flatnonzero(cols)
+            if ink.size == 0:
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            cuts, run_start = [], None
+            for c in range(ink[0], ink[-1] + 1):
+                if not cols[c]:
+                    run_start = c if run_start is None else run_start
+                elif run_start is not None:
+                    if c - run_start >= max(1.3 * h, 12):
+                        cuts.append((run_start, c))
+                    run_start = None
+            if not cuts:
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            edges = [ink[0]] + [v for a, b in cuts for v in (a, b)] + [ink[-1] + 1]
+            for a, b in zip(edges[::2], edges[1::2]):
+                sx0, sx1 = x0 + a - 2, x0 + b + 2
+                pending.append((sx0, y0, sx1, y1, img[max(y0, 0):y1, max(sx0, 0):sx1]))
+        if pending:
+            rec = self._engine.text_rec(TextRecInput(img=[p[4] for p in pending]))
+            for (sx0, sy0, sx1, sy1, _), t in zip(pending, rec.txts):
+                if t.strip():
+                    out.append((sx0, sy0, sx1, sy1, t))
+        return out
 
     def recognize(self, img: np.ndarray, keep_line_breaks: bool = False) -> str:
         return to_text(self.analyze(img), keep_line_breaks)
