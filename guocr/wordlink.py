@@ -25,7 +25,7 @@ user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 
-_WORD = re.compile(r"[A-Za-z0-9À-ɏ]+|[一-鿿]")  # 西文按词、中文按字对齐
+_WORD = re.compile(r"[A-Za-z0-9À-ɏ]+|[一-鿿぀-ヿ]")  # 西文按词，中文、日文按字对齐
 _CTRL = {"\x07": "\t", "\x0b": "\n", "\x0c": "\n", "\x0e": "\n", "\x01": "", "\x02": "", "\x13": "", "\x14": "",
          "\x15": "", "\x1e": "-", "\x1f": "", "\xa0": " "}
 

@@ -1,6 +1,6 @@
 """在线翻译（Google 翻译的免费接口，只用标准库）。
 
-固定译成简体中文（英译中）。
+固定译成简体中文（英文、日文等外文 → 中文）。
 在线：Google 的 dict-chrome 接口（一次提交多段、逐段返回，正好用于把译文按段落贴回截图），失败退回 gtx 接口；
 离线：内置 OPUS-MT 模型（CTranslate2 推理）。默认在线优先，访问不了 Google 时自动改用离线。
 """
@@ -173,6 +173,14 @@ def _tidy(s: str) -> str:
 
 
 def _via_offline(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: ARG001
+    """兜底小模型（OPUS-MT，只会英译中）：日文段落原样返回，不交给它（会翻出乱码）。"""
+    if any(is_japanese(s_) for s_ in lines):
+        ja = [i for i, s_ in enumerate(lines) if is_japanese(s_)]
+        rest = [i for i in range(len(lines)) if i not in ja]
+        out = list(lines)
+        for i, zh in zip(rest, _via_offline([lines[i] for i in rest], tl, timeout) if rest else []):
+            out[i] = zh
+        return out
     global _offline
     if _offline is None:
         import os
@@ -252,8 +260,18 @@ LLAMA_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_BUI
 LLAMA_KEEP = ("llama-server.exe", "llama-server-impl.dll", "llama-common.dll", "llama.dll", "mtmd.dll", "libomp.dll",
               "LICENSE-LLVM-OpenMP")  # 另外保留全部 ggml*.dll（含按 CPU 型号自动选择的优化版本）
 NEED_VRAM_MIB = 2600  # 模型约 1.9 GB + 上下文缓存
-_LLM_SYSTEM = ("你是专业翻译。把用户给出的英文准确、通顺地翻译成简体中文，专业术语使用规范译名。"
+_LLM_SYSTEM = ("你是专业翻译。把用户给出的外文（英文、日文等）准确、通顺地翻译成简体中文，专业术语使用规范译名。"
+               "日文里的汉字词也要按中文习惯译出，不要照搬日文写法。"
                "保留数字、公式、代码、产品名和专有名词原样。只输出译文，不要解释，不要加引号。")
+
+
+def _kana(text: str) -> int:
+    """日文假名个数（平假名 3040–309F、片假名 30A0–30FF、半角片假名 FF66–FF9F）。"""
+    return sum(1 for c in text if "぀" <= c <= "ヿ" or "ｦ" <= c <= "ﾟ")
+
+
+def is_japanese(text: str) -> bool:
+    return _kana(text) >= max(2, len(text) // 20)
 
 
 def _base_dir() -> str:
@@ -419,7 +437,9 @@ def shutdown() -> None:
 
 
 def _untranslated(src: str, out: str) -> bool:
-    """模型偶尔原样输出英文：译文里几乎没有汉字、而原文有不少字母时视为没翻。"""
+    """模型偶尔原样输出原文：英文原文而译文里几乎没有汉字，或日文原文而译文里仍有大量假名，视为没翻。"""
+    if is_japanese(src):
+        return _kana(out) > max(2, _kana(src) // 3)
     han = sum(1 for c in out if "\u4e00" <= c <= "\u9fff")
     letters = sum(1 for c in src if c.isascii() and c.isalpha())
     return letters >= 4 and han < max(1, letters // 20)
@@ -471,7 +491,13 @@ def _via_llm(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: A
         elif _progress is not None:
             _progress(i, zh)
         out.append(zh)
-    if failed:  # 个别段落没翻出来，用小模型补上
+    retry = [i for i in failed if is_japanese(lines[i])]
+    for i in retry:  # 日文：兜底小模型只会英译中，改为让大模型再翻一次（不带术语提示）
+        zh = _llm_once(_LLM_SYSTEM, lines[i])
+        if not _untranslated(lines[i], zh):
+            out[i] = zh
+    failed = [i for i in failed if i not in retry]
+    if failed:  # 个别英文段落没翻出来，用小模型补上
         for i, zh in zip(failed, _via_offline([lines[i] for i in failed], tl, timeout)):
             out[i] = zh
     return out

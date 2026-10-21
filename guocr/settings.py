@@ -41,7 +41,7 @@ class SettingsDialog(QDialog):
             grid.addWidget(mark, row, 3)
             self.edits[action], self.marks[action] = edit, mark
         grid.setColumnStretch(1, 1)
-        tips = QLabel("截图：复制图片到剪贴板　识别文字：复制文字　翻译：英译中，译文覆盖在原位")
+        tips = QLabel("截图：复制图片到剪贴板　识别文字：复制文字　翻译：外译中（英、日等），译文覆盖在原位")
         tips.setStyleSheet("color: #666;")
 
         self.show_result = QCheckBox("识别后弹出结果窗口（关闭则只在托盘气泡提示；翻译总会弹窗）")
@@ -53,7 +53,7 @@ class SettingsDialog(QDialog):
             self.engine.addItem(label, key)
         self.engine.setCurrentIndex(max(self.engine.findData(cfg.translate_engine), 0))
         engine_row = QHBoxLayout()
-        engine_row.addWidget(QLabel("翻译引擎（英译中）："))
+        engine_row.addWidget(QLabel("翻译引擎（外译中：英、日等）："))
         engine_row.addWidget(self.engine, 1)
         # 离线翻译的专业词库
         self.domain_boxes = {}
