@@ -80,9 +80,12 @@ def is_name_list(text: str) -> bool:
     return sum(bool(_NAME.match(s)) for s in items) >= 0.7 * len(items)
 
 
+_URL = re.compile(r"\s*((https?://|www\.)\S+|[\w.+-]+@[\w-]+\.[\w.]+)\s*", re.I)
+
+
 def _translate_paragraphs(lines: list[str], timeout: float, engine: str) -> list[str]:
-    keep = [i for i, s in enumerate(lines) if is_name_list(s)]
-    if keep:  # 作者名单原样保留，其余照常翻译
+    keep = [i for i, s in enumerate(lines) if is_name_list(s) or _URL.fullmatch(s)]
+    if keep:  # 作者名单、网址、邮箱原样保留，其余照常翻译
         rest = [i for i in range(len(lines)) if i not in keep]
         out = list(lines)
         if rest:
@@ -263,6 +266,24 @@ NEED_VRAM_MIB = 2600  # 模型约 1.9 GB + 上下文缓存
 _LLM_SYSTEM = ("你是专业翻译。把用户给出的外文（英文、日文等）准确、通顺地翻译成简体中文，专业术语使用规范译名。"
                "日文里的汉字词也要按中文习惯译出，不要照搬日文写法。"
                "保留数字、公式、代码、产品名和专有名词原样。只输出译文，不要解释，不要加引号。")
+# 日文原文另加的说明：3B 小模型对口语、关西腔和论文标题常译错（“はじめに”译成“开始”、“ちゃう”译成“抱歉”）
+_LLM_JA = "\n原文是日文。片假名的人名、角色名按读音译出或保留原文。译文里不要出现日文假名，章节编号（第一章等）要保留。"
+# 关西腔等口语：只在原文里出现这些说法时才加说明（否则小模型会把普通句子也译得很口语）
+_JA_DIALECT = re.compile(r"やん|ちゃう|へん[。！？!?、]|ほんま|なんや|やし|ねん|はる")
+_LLM_DIALECT = ("这是口语（关西腔），请按意思译成自然的中文口语："
+                "「〜やん」=「〜じゃない」（……嘛、不是……吗），「ちゃう」=「違う」（不对、不是），"
+                "「〜んちゃうん」=「〜んじゃないの」（不是……吗），「〜わけない」（怎么可能……），"
+                "「〜や」=「〜だ」，「〜へん」=「〜ない」，「ほんま」=「本当」。")
+# 重翻后仍照搬下来的常见日文词
+_JA_LEFT = {"違う": "不对", "ちゃう": "不对", "ほんま": "真的"}
+
+
+def _ja_note(text: str) -> str:
+    return _LLM_JA + (_LLM_DIALECT if _JA_DIALECT.search(text) else "")
+
+
+_JA_TERMS = {"はじめに": "引言", "おわりに": "结语", "まとめ": "总结", "目次": "目录", "謝辞": "致谢",
+             "序論": "绪论", "結論": "结论", "考察": "讨论", "要旨": "摘要", "付録": "附录"}
 
 
 def _kana(text: str) -> int:
@@ -436,6 +457,20 @@ def shutdown() -> None:
     _server.stop()
 
 
+def _ja_heading(text: str) -> str | None:
+    """“はじめに”“第一章 はじめに”这类日文标题直接查表（小模型会把编号丢掉或把“はじめに”译成“开始”）。"""
+    m = re.fullmatch(r"\s*(第[一二三四五六七八九十百\d０-９]+[章節部編])?\s*(\S+?)\s*", text)
+    if not m or m.group(2) not in _JA_TERMS:
+        return None
+    head = (m.group(1) or "").replace("節", "节").replace("編", "编")
+    return f"{head} {_JA_TERMS[m.group(2)]}".strip()
+
+
+def _kana_left(src: str, out: str) -> bool:
+    """日文原文的译文里还夹着假名（如照搬“違う違う”）。"""
+    return is_japanese(src) and _kana(out) > 0
+
+
 def _untranslated(src: str, out: str) -> bool:
     """模型偶尔原样输出原文：英文原文而译文里几乎没有汉字，或日文原文而译文里仍有大量假名，视为没翻。"""
     if is_japanese(src):
@@ -445,8 +480,15 @@ def _untranslated(src: str, out: str) -> bool:
     return letters >= 4 and han < max(1, letters // 20)
 
 
+_LOOP = re.compile(r"(.{1,4}?)\1{5,}")  # 同一个字/词连续重复 6 次以上：小模型生成卡进了循环
+
+
 def _llm_once(system: str, text: str) -> str:
     zh = _server.chat(system, text).strip().strip("“”\"'")
+    if _LOOP.search(zh) and not _LOOP.search(text):
+        # 换成带重复惩罚、略有随机性的采样再试一次；仍然循环就把重复的部分压成一次
+        zh = _server.chat(system, text, {"temperature": 0.4, "repeat_penalty": 1.3}).strip().strip("“”\"'")
+        zh = _LOOP.sub(r"\1", zh)
     for prefix in ("译文：", "译文:", "翻译：", "翻译:"):
         zh = zh.removeprefix(prefix).strip()
     return zh
@@ -468,14 +510,18 @@ def _via_llm(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: A
         if not text.strip() or not any(c.isalpha() for c in text):
             out.append(text)
             continue
-        fixed = _glossary(text) or gloss.exact(text)
+        fixed = _glossary(text) or gloss.exact(text) or _ja_heading(text)
         if fixed:
             out.append(fixed)
             continue
         hints = gloss.hits(text)
+        ja = is_japanese(text) or text.strip() in _JA_TERMS
+        if ja:
+            hints.update({k: v for k, v in _JA_TERMS.items() if k in text})
+        base = _LLM_SYSTEM + (_ja_note(text) if ja else "")
         # 术语放进系统提示；正文只放原文，否则小模型容易被提示格式带偏
-        system = _LLM_SYSTEM if not hints else (
-            _LLM_SYSTEM + "\n下列术语请使用指定译名：" + "；".join(f"{en} → {zh}" for en, zh in hints.items()) + "。")
+        system = base if not hints else (
+            base + "\n下列术语请使用指定译名：" + "；".join(f"{en} → {zh}" for en, zh in hints.items()) + "。")
         from . import context
         extra = context.prompt_for(text)  # 用户设定的翻译语境（当前预设）
         if extra:
@@ -483,9 +529,19 @@ def _via_llm(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: A
         zh = _llm_once(system, text)
         if hints and _leftover_english(text, zh):
             # 术语一多，3B 小模型偶尔会夹带英文原词；去掉术语提示重翻一次，通顺优先
-            plain = _llm_once(_LLM_SYSTEM, text)
+            plain = _llm_once(base, text)
             if not _leftover_english(text, plain):
                 zh = plain
+        for _ in range(2):
+            if not _kana_left(text, zh):
+                break
+            # 照搬了日文：换成略带随机性的采样重翻，取假名更少的结果
+            again = _server.chat(system, text, {"temperature": 0.5}).strip().strip("“”\"'")
+            if _kana(again) < _kana(zh) and not _LOOP.search(again):
+                zh = again
+        if _kana_left(text, zh):
+            for k, v in _JA_LEFT.items():
+                zh = zh.replace(k, v)
         if _untranslated(text, zh):
             failed.append(i)
         elif _progress is not None:
@@ -493,7 +549,7 @@ def _via_llm(lines: list[str], tl: str, timeout: float) -> list[str]:  # noqa: A
         out.append(zh)
     retry = [i for i in failed if is_japanese(lines[i])]
     for i in retry:  # 日文：兜底小模型只会英译中，改为让大模型再翻一次（不带术语提示）
-        zh = _llm_once(_LLM_SYSTEM, lines[i])
+        zh = _llm_once(_LLM_SYSTEM + _ja_note(lines[i]), lines[i])
         if not _untranslated(lines[i], zh):
             out[i] = zh
     failed = [i for i in failed if i not in retry]

@@ -1,5 +1,6 @@
 """OCR 引擎（RapidOCR + onnxruntime，离线）与文字版面还原。"""
 import logging
+import difflib
 import re
 import time
 
@@ -7,7 +8,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtGui import QImage
 
-from .layout import Paragraph, analyze, to_text
+from .layout import Paragraph, analyze, japanese_forms, to_text
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,20 @@ def detect_pages(img: np.ndarray) -> list[tuple[int, int, int, int]]:
         if area < 0.55 * bw * bh:  # 页面里大部分应是白色（文字之间的空白连成一片）
             continue
         pages.append((int(x * scale), int(y * scale), int((x + bw) * scale), int((y + bh) * scale)))
+    # 真正的页面是矩形：四个角（略往里）都是白的；漫画的对话气泡多是椭圆，角上不是白色，不能当页面
+    full_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    def rectangular(r):
+        x0, y0, x1, y1 = r
+        ins = max(3, (x1 - x0) // 40)
+        pts = [(y0 + ins, x0 + ins), (y0 + ins, x1 - 1 - ins), (y1 - 1 - ins, x0 + ins), (y1 - 1 - ins, x1 - 1 - ins)]
+        return all(0 <= y < h and 0 <= x < w and full_gray[y, x] >= 240 for y, x in pts)
+
+    pages = [r for r in pages if rectangular(r)]
+    # 多页并排时各页宽度基本一致（被截掉一半的页高度可以不同）
+    if pages:
+        wmed = sorted(r[2] - r[0] for r in pages)[len(pages) // 2]
+        pages = [r for r in pages if abs((r[2] - r[0]) - wmed) <= 0.1 * wmed]
     if len(pages) < 2 or sum((r[2] - r[0]) * (r[3] - r[1]) for r in pages) > 0.97 * w * h:
         return []
     return pages
@@ -121,10 +136,11 @@ class OcrEngine:
             return []
         items = []
         split = self._split_wide_gaps(padded, result.boxes, result.txts)
-        for x0, y0, x1, y1, txt in self._recognize_vertical(padded, split):
+        for x0, y0, x1, y1, txt in self._recognize_vertical(padded, self._split_columns(padded, split)):
             items.append((x0 - PAD, y0 - PAD, x1 - PAD, y1 - PAD, clean_marks(txt.strip())))
         pages = detect_pages(img)
         paras = analyze(items, pages)
+        japanese_forms(paras)
         if origin is not None and paras:
             from . import wordlink
             from .layout import _order_pages
@@ -223,10 +239,10 @@ class OcrEngine:
 
     # ---------------------------------------------------------------- 竖排识别
     @staticmethod
-    def _vertical_cells(gray: np.ndarray, w: int, bg: float) -> list[tuple[int, int]]:
+    def _vertical_cells(mask: np.ndarray, w: int) -> list[tuple[int, int]]:
         """把竖排的一列按字切开：按行投影找空白，把同一个字的几段笔画（如“三”“二”）合并成约一个字高的格子，
-        粘连在一起过高的按字宽均分。"""
-        ink = (np.abs(gray - bg) > 50).any(axis=1)
+        粘连在一起过高的按字宽均分。竖排标点（右侧的小点）单独成格；“！”下面的点并回上一格。"""
+        ink = mask.any(axis=1)
         runs, s = [], None
         for i, f in enumerate(ink):
             if f and s is None:
@@ -236,47 +252,95 @@ class OcrEngine:
                 s = None
         if s is not None:
             runs.append([s, len(ink)])
+
+        def xr(a, b):
+            xs = np.flatnonzero(mask[a:b].any(axis=0))
+            return (xs[0], xs[-1] + 1) if xs.size else (0, 0)
+
         merged: list[list[int]] = []
         for a, b in runs:
-            if merged and (b - merged[-1][0]) <= 1.05 * w and (a - merged[-1][1]) < 0.12 * w:
-                merged[-1][1] = b
-            else:
-                merged.append([a, b])
+            if merged:
+                pa, pb = merged[-1]
+                x0, x1 = xr(a, b)
+                px0, px1 = xr(pa, pb)
+                small = b - a < 0.4 * w and x1 - x0 < 0.4 * w
+                punct = small and x0 > 0.45 * w                       # 、。在格子右上：不并
+                bang = small and x1 - x0 < 0.25 * w and b - a > 0.5 * (x1 - x0) \
+                    and px1 - px0 < 0.3 * w and pb - pa > 0.45 * w \
+                    and abs((x0 + x1) - (px0 + px1)) < 0.3 * w           # “！”的竖条 + 下面的点
+                # 字最下面一笔扁平的横（“題”“且”的底横）与上面隔得稍远时也并回去
+                foot = b - a < 0.2 * w and x1 - x0 > 0.4 * w and pb - pa > 0.7 * w and px1 - px0 > 0.5 * w \
+                    and (b - pa) <= 1.1 * w and (a - pb) < 0.2 * w
+                if bang or foot or (not punct and (b - pa) <= 1.05 * w and (a - pb) < 0.12 * w):
+                    merged[-1][1] = b
+                    continue
+            merged.append([a, b])
         cells = []
         for a, b in merged:
             n = max(1, round((b - a) / (0.95 * w))) if b - a > 1.3 * w else 1
             cells += [(a + (b - a) * k // n, a + (b - a) * (k + 1) // n) for k in range(n)]
         return cells
 
+    @staticmethod
+    def _strip_frame(mask: np.ndarray) -> np.ndarray:
+        """去掉混进列里的气泡边框、分格线：贯穿大半列高的竖线、贯穿整列宽的横线（字的笔画不会这么长）。"""
+        mask = mask.copy()
+        h, w = mask.shape
+        if h >= 2 * w:
+            long_x = mask.mean(axis=0) > 0.6
+            mask[:, long_x] = False
+        long_y = mask.mean(axis=1) > 0.95
+        if long_y.any() and w >= 8:
+            mask[long_y] = False
+        return mask
+
     def _vertical_to_line(self, img: np.ndarray, rect) -> np.ndarray | None:
         """竖排一列 → 横排一行：逐字放进方格并按字形摆正后横向拼接，再交给（为横排训练的）识别模型。
         - 竖排标点（、。）位于字格右上方 → 移到横排标点的位置（左下）；
         - 竖排的长音“ー”是细长竖线 → 改画成横线；
-        - 其余（含小写假名、“一”这类扁平字）在格子里居中。
+        - 竖排的括号「」『』（角在右上/左下）→ 转 90° 成横排括号；
+        - 小写假名（ぁっゃ…）→ 贴格子底部（横排小写假名的位置）；
+        - 其余（含“一”这类扁平字）在格子里居中。
         直接把整列旋转 90° 去识别，会漏掉标点、长音和小写假名（实测准确率 92% → 本方法 97%）。"""
         x0, y0, x1, y1 = rect
         col = img[max(y0, 0):y1, max(x0, 0):x1]
         if col.size == 0:
             return None
         g = col.mean(axis=2)
-        w = col.shape[1]
         bg = float(np.median(np.concatenate([g[0], g[-1]])))
+        raw = np.abs(g - bg) > 50
+        mask = self._strip_frame(raw)
+        xs = np.flatnonzero(mask.any(axis=0))
+        if xs.size == 0:
+            return None
+        if (mask != raw).any():  # 去掉了边框：按真正有字的宽度裁列
+            col, mask = col[:, xs[0]:xs[-1] + 1].copy(), mask[:, xs[0]:xs[-1] + 1]
+            col[~mask] = int(bg)
+        w = col.shape[1]
         tiles = []
-        for a, b in self._vertical_cells(g, w, bg):
-            piece = col[a:b]
-            ys, xs = np.nonzero(np.abs(g[a:b] - bg) > 50)
+        for a, b in self._vertical_cells(mask, w):
+            ys, xs = np.nonzero(mask[a:b])
             if ys.size == 0:
                 continue
             iy0, iy1, ix0, ix1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-            glyph = piece[iy0:iy1, ix0:ix1]
+            glyph = col[a:b][iy0:iy1, ix0:ix1]
+            gm = mask[a:b][iy0:iy1, ix0:ix1]
             ih, iw = glyph.shape[:2]
             tile = np.full((w, w, 3), int(bg), np.uint8)
             if ih < 0.45 * w and iw < 0.45 * w and ix0 > 0.35 * w:  # 竖排标点 → 左下
                 m = max(1, w // 10)
                 tile[w - ih - m:w - m, m:m + iw] = glyph
-            elif ih > 0.5 * w and iw < 0.22 * w:  # 竖排长音 → 横线
+            elif ih > 0.5 * w and iw < 0.22 * w and gm.any(axis=1).all() and abs(ix0 + ix1 - w) < 0.4 * w:  # 竖排长音（连续竖条；“！”中间断开）→ 横线（须在列中间；贴着列边的竖条是相邻那列伸过来的」）
                 th = max(2, iw)
                 tile[w // 2 - th // 2:w // 2 - th // 2 + th, w // 8:w - w // 8] = glyph.min(axis=(0, 1))
+            elif self._is_bracket(gm, w):  # 竖排括号 → 横排括号
+                r = np.ascontiguousarray(np.rot90(glyph, 1))
+                rh, rw = min(r.shape[0], w), min(r.shape[1], w)
+                tile[(w - rh) // 2:(w - rh) // 2 + rh, (w - rw) // 2:(w - rw) // 2 + rw] = r[:rh, :rw]
+            elif 0.25 * w < ih < 0.72 * w and 0.25 * w < iw < 0.72 * w and gm.mean() > 0.12:  # 小写假名 → 贴底
+                m = max(1, w // 12)
+                ox = (w - iw) // 2
+                tile[w - ih - m:w - m, ox:ox + iw] = glyph
             else:
                 ih, iw = min(ih, w), min(iw, w)
                 oy, ox = (w - ih) // 2, (w - iw) // 2
@@ -285,24 +349,149 @@ class OcrEngine:
             tiles.append(np.full((w, max(2, w // 8), 3), int(bg), np.uint8))
         return np.concatenate(tiles, axis=1) if tiles else None
 
-    def _recognize_vertical(self, img: np.ndarray, items: list) -> list:
-        """对竖排的中日文列改用逐字摆正的方式重新识别（横排、竖排的西文不动）。"""
-        from rapidocr.ch_ppocr_rec.typings import TextRecInput
-        idx, lines = [], []
-        for i, (x0, y0, x1, y1, txt) in enumerate(items):
-            if (y1 - y0) > 2.5 * (x1 - x0) and re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", txt):
-                line = self._vertical_to_line(img, (int(x0), int(y0), int(x1), int(y1)))
-                if line is not None:
-                    idx.append(i)
-                    lines.append(line)
-        if not lines:
-            return items
-        rec = self._engine.text_rec(TextRecInput(img=lines))
-        out = list(items)
-        for i, t in zip(idx, rec.txts):
-            if t.strip():
-                out[i] = (*items[i][:4], t)
+    @staticmethod
+    def _is_bracket(gm: np.ndarray, w: int) -> bool:
+        """竖排的「」：扁平的直角——一条横线加一端短短的竖钩（﹁ 钩在右、﹂ 钩在左），中间空。"""
+        h, ww = gm.shape
+        if ww < 0.5 * w or h > 0.5 * w or h < 3 or ww < 3 * h:
+            return False
+        e = max(1, round(0.4 * h))  # 线条粗细（放大过的小字边缘发虚，留点余量）
+        top, bot = gm[:e].any(axis=0).mean() > 0.8, gm[-e:].any(axis=0).mean() > 0.8
+        left, right = gm[:, :e].any(axis=1).mean() > 0.7, gm[:, -e:].any(axis=1).mean() > 0.7
+        body = gm[e:-e, e:-e]
+        return ((top and right and not left) or (bot and left and not right)) and body.mean() < 0.15
+
+    VERTICAL_RATIO = 1.4  # 列高 / 列宽 超过它就算竖排的一列（“あ、”“誰が”这种两个字的短列也算；横排两个字约 0.5）
+
+    def _split_columns(self, img: np.ndarray, items: list) -> list:
+        """按像素找出框里的竖排字带：漫画气泡里的竖排字小、列又挨得近，文字检测常把几列连成一个框，
+        再当横排去读（“フリにして著作権背景を…”）。按列投影找出一条条笔画带，若是又高又窄的竖条
+        （横排文字按列投影是一个个近似方形的字，不会被误判），就把框拆成各列；拆出的列标记为待重新识别。"""
+        out = []
+        gray = img.mean(axis=2)
+        for x0, y0, x1, y1, txt in items:
+            ix0, iy0, ix1, iy1 = int(x0), int(y0), int(np.ceil(x1)), int(np.ceil(y1))
+            region = gray[max(iy0, 0):iy1, max(ix0, 0):ix1]
+            if region.size == 0 or not re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", txt) \
+                    or re.search(r"[A-Za-z]{4,}", txt):  # 只处理中日文
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            bg = np.median(np.concatenate([region[0], region[-1], region[:, 0], region[:, -1]]))
+            ink = np.abs(region - bg) > 60
+            cols = ink.any(axis=0)
+            # 列投影上的笔画带（允许很窄的空隙：同一列里各字左右宽窄不一）
+            runs, s = [], None
+            for i, f in enumerate(cols):
+                if f and s is None:
+                    s = i
+                elif not f and s is not None:
+                    runs.append([s, i])
+                    s = None
+            if s is not None:
+                runs.append([s, len(cols)])
+            merged: list[list[int]] = []
+            widest = max((b - a for a, b in runs), default=0)
+            for a, b in runs:
+                # 空隙很窄，或这一段/上一段只是很窄的碎条（某个字的一撇一点）：并入上一段
+                if merged and (a - merged[-1][1] < max(2, 0.25 * min(b - a, merged[-1][1] - merged[-1][0]))
+                               or b - a < 0.35 * widest or merged[-1][1] - merged[-1][0] < 0.35 * widest) \
+                        and b - merged[-1][0] <= 1.4 * widest:
+                    merged[-1][1] = b
+                else:
+                    merged.append([a, b])
+            stripes = []
+            for a, b in merged:
+                rows = np.flatnonzero(ink[:, a:b].any(axis=1))
+                if rows.size:
+                    stripes.append((a, rows[0], b, rows[-1] + 1))
+            widths = [b - a for a, _, b, _ in stripes]
+            if not stripes or max(widths) < 6:
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            wmed = float(np.median(widths))
+            vert = [st for st in stripes if (st[3] - st[1]) >= self.VERTICAL_RATIO * (st[2] - st[0])
+                    and (st[2] - st[0]) >= 0.5 * wmed]
+            # 多数笔画带是竖条才拆（横排一行按列投影是一个个方形的字）
+            if len(vert) == 0 or len(vert) < 0.6 * len([w for w in widths if w >= 0.5 * wmed]):
+                out.append((x0, y0, x1, y1, txt))
+                continue
+            for a, ta, b, tb in vert:
+                out.append((ix0 + a - 1, iy0 + ta - 1, ix0 + b + 1, iy0 + tb + 1, txt if len(vert) == 1 else ""))
         return out
+
+    def _recognize_vertical(self, img: np.ndarray, items: list) -> list:
+        """竖排的中日文列：分别用“整列旋转 90°”（检测时的默认做法）和“逐字摆正”两种方式识别，
+        取识别模型置信度更高的结果。逐字摆正能找回标点、长音和小写假名，但字很小（十几像素）时
+        切出的单字太小反而容易认错，所以两者择优；字太小的列先放大再切字。"""
+        import cv2
+        from rapidocr.ch_ppocr_rec.typings import TextRecInput
+        idx, tiled, rotated = [], [], []
+        for i, (x0, y0, x1, y1, txt) in enumerate(items):
+            # 竖排的中日文列（含刚从合并框里拆出、还没有文字的列）
+            if (y1 - y0) >= self.VERTICAL_RATIO * (x1 - x0) and (
+                    not txt or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", txt)):
+                ix0, iy0, ix1, iy1 = int(x0), int(y0), int(np.ceil(x1)), int(np.ceil(y1))
+                col = img[max(iy0, 0):iy1, max(ix0, 0):ix1]
+                if col.size == 0:
+                    continue
+                if col.shape[1] < 28:  # 字太小：放大后再切字
+                    k = 32 / col.shape[1]
+                    col = cv2.resize(col, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
+                line = self._vertical_to_line(col, (0, 0, col.shape[1], col.shape[0]))
+                if line is None:
+                    continue
+                idx.append(i)
+                tiled.append(line)
+                rotated.append(np.ascontiguousarray(np.rot90(col)))  # 逆时针转 90°：竖排的字变成横躺
+        if not idx:
+            return items
+        rec_t = self._engine.text_rec(TextRecInput(img=tiled))
+        rec_r = self._engine.text_rec(TextRecInput(img=rotated))
+        out = list(items)
+        for k, i in enumerate(idx):
+            t_t, s_t = rec_t.txts[k], float(rec_t.scores[k])
+            t_r, s_r = rec_r.txts[k], float(rec_r.scores[k])
+            text = self._pick_vertical(t_t, s_t, t_r, s_r)
+            if text.strip():
+                out[i] = (*items[i][:4], text)
+        return out
+
+    # 逐字摆正比整列旋转多认出来的、可以信的字：标点、长音、小写假名（整列旋转常漏掉它们）
+    _V_EXTRA = set("、。，．！？!?ー・っゃゅょぁぃぅぇぉッャュョァィゥェォ「」『』…")
+
+    @classmethod
+    def _pick_vertical(cls, t_t: str, s_t: float, t_r: str, s_r: float) -> str:
+        """合并“逐字摆正”(a) 和“整列旋转”(b) 两种结果：逐段对齐两者，
+        - a 多出的标点、长音、小写假名保留（整列旋转常漏掉它们），多出的其他字（切字切出的碎块）丢掉；
+        - b 多出的字保留（逐字切字偶尔漏字）；
+        - 两者不同的地方：b 是西文（竖排里横躺的 PDF、Windows，整列旋转后正好摆正）用 b，
+          否则逐字切字容易切坏，除非 a 的置信度明显更高，用 b。"""
+        norm = lambda t: t.replace("!", "！").replace("?", "？")
+        a, b = norm(t_t), norm(t_r)
+        if "・" in a and "・" not in b:
+            a = a.replace("・", "")
+        trust_a = s_t > s_r + 0.02
+        # 相邻的不同之处合成一段（“モーテル/モデル”里的 ー 和 テ 一起算替换，而不是插入一个长音）
+        chunks = []
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, b, a, autojunk=False).get_opcodes():
+            if tag != "equal" and chunks and chunks[-1][0] != "equal":
+                chunks[-1] = ("diff", chunks[-1][1], i2, chunks[-1][3], j2)
+            else:
+                chunks.append((tag, i1, i2, j1, j2))
+        out = []
+        for tag, i1, i2, j1, j2 in chunks:
+            sa, sb = a[j1:j2], b[i1:i2]
+            if tag == "equal":
+                out.append(sa)
+            elif not sb:                                    # 只有 a 多出
+                out.append(sa if all(ch in cls._V_EXTRA for ch in sa) else "")
+            elif not sa:                                    # 只有 b 多出
+                out.append(sb)
+            elif re.search(r"[A-Za-z0-9]", sb):
+                out.append(sb)
+            else:
+                out.append(sa if trust_a else sb)
+        return "".join(out)
 
     def recognize(self, img: np.ndarray, keep_line_breaks: bool = False) -> str:
         return to_text(self.analyze(img), keep_line_breaks)

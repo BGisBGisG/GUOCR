@@ -6,9 +6,9 @@
 保存在 %APPDATA%/GUOCR/presets.json。
 """
 import json
-import re
 import logging
 import os
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 
@@ -142,15 +142,28 @@ def learn(preset: Preset, text: str) -> str:
     return reply
 
 
+def _relevant(summary: str, low: str) -> str:
+    """去掉概述里讲具体某个外文词、而这个词本段并没有出现的分句：小模型会把“X 译为 Y”硬套到无关的文字上
+    （例如把漫画人名译成“纤维蛋白纤维网络”）。"""
+    keep = []
+    for clause in re.split(r"(?<=[，。；;,])", summary or ""):
+        words = re.findall(r"[A-Za-z][A-Za-z\- ]*[A-Za-z]|[゠-ヿ]{2,}", clause)
+        if any(w.lower() not in low for w in words if len(w) >= 3 or not w.isascii()):
+            continue
+        keep.append(clause)
+    return "".join(keep).strip("，,；; ")
+
+
 def prompt_for(text: str) -> str:
     """当前预设要追加到翻译指令里的内容（只带上本段里出现的词义，避免指令过长）。"""
     p = active_preset()
     if p is None:
         return ""
     parts = []
-    if p.summary:
-        parts.append("本次翻译的语境与要求（用户设定，必须遵守）：" + p.summary)
     low = text.lower()
+    summary = _relevant(p.summary, low)
+    if summary:
+        parts.append("本次翻译的语境与要求（用户设定，必须遵守）：" + summary)
     hits = [(w, m) for w, m in p.terms.items() if w.lower() in low]
     if hits:
         parts.append("在此语境下下列词的含义/译法：" + "；".join(f"{w} → {m}" for w, m in hits))

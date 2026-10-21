@@ -192,6 +192,7 @@ def _draw_vertical(p: QPainter, cols: list, text: str, W: int, H: int) -> None:
     top = min(i[1] for i in inks)
     bottom = max(i[3] for i in inks)
     right = max(i[2] for i in inks)
+    left = min(i[0] for i in inks)
     centers = sorted(((i[0] + i[2]) / 2 for i in inks), reverse=True)
     pitch = (centers[0] - centers[-1]) / (len(centers) - 1) if len(centers) > 1 else cw * 1.6
     chars = [ch for ch in text if not ch.isspace()]
@@ -201,7 +202,9 @@ def _draw_vertical(p: QPainter, cols: list, text: str, W: int, H: int) -> None:
         step = size * 1.05
         per_col = max(1, int((bottom - top) // step))
         ncols = -(-len(chars) // per_col)
-        if ncols <= len(cols) or size <= cw * 0.6:
+        # 列数不超过原来的列，且各列（按字号留出列距）横向放得下
+        fits = ncols <= len(cols) and (ncols - 1) * max(pitch * size / (cw * 0.95), size * 1.3) <= right - left - cw / 2
+        if fits or size <= cw * 0.45:
             break
         size -= 0.5
     font.setPixelSize(int(max(size, 8)))

@@ -298,9 +298,28 @@ def _paragraphs(lines: list[Line]) -> list[Paragraph]:
 
 # ------------------------------------------------------------------ 竖排（日文、繁体古籍等）
 def _is_vertical(it: Box) -> bool:
-    """竖排的一列：高明显大于宽（单个字的框不算）。"""
+    """竖排的一列：高至少是宽的 1.4 倍（漫画气泡里“あ、”这种两个字的短列也算；单个字的框不算）。"""
     w, h = it[2] - it[0], it[3] - it[1]
-    return h > 2.5 * w and len(it[4].strip()) >= 2
+    return h >= 1.4 * w and len(it[4].strip()) >= 2
+
+
+def _order_by_bands(paras: list[Paragraph], right_to_left: bool) -> list[Paragraph]:
+    """混排页面（如漫画：竖排对白 + 横排字幕、拟声词）的阅读顺序：按纵向重叠把段落分成一层层，
+    先上后下；同一层里竖排读物从右往左（横排为主的页面从左往右）。"""
+    bands: list[list[Paragraph]] = []
+    for p in sorted(paras, key=lambda p_: p_.bbox[1]):
+        x0, y0, x1, y1 = p.bbox
+        for band in bands:
+            top, bottom = min(q.bbox[1] for q in band), max(q.bbox[3] for q in band)
+            if min(y1, bottom) - max(y0, top) > 0.4 * min(y1 - y0, bottom - top):
+                band.append(p)
+                break
+        else:
+            bands.append([p])
+    out = []
+    for band in bands:
+        out += sorted(band, key=lambda p_: -p_.bbox[2] if right_to_left else p_.bbox[0])
+    return out
 
 
 def _vertical_paragraphs(items: list[Box]) -> list[Paragraph]:
@@ -313,9 +332,10 @@ def _vertical_paragraphs(items: list[Box]) -> list[Paragraph]:
         best = None
         for b in blocks:
             last = b[-1]
-            gap = last.x0 - c.x1
+            # 按列中心算间距：拆出来的相邻列框常有几像素重叠
+            gap = ((last.x0 + last.x1) - (c.x0 + c.x1)) / 2 - cw
             overlap = min(c.y1, last.y1) - max(c.y0, last.y0)
-            if -0.3 * cw <= gap <= 2.0 * cw and overlap > 0.3 * min(c.y1 - c.y0, last.y1 - last.y0):
+            if -0.6 * cw <= gap <= 1.6 * cw and overlap > 0.3 * min(c.y1 - c.y0, last.y1 - last.y0):
                 best = b
                 break
         if best is None:
@@ -327,6 +347,10 @@ def _vertical_paragraphs(items: list[Box]) -> list[Paragraph]:
     paras: list[Paragraph] = []
     for b in blocks:
         top, bottom = min(c.y0 for c in b), max(c.y1 for c in b)
+        # 列都很短（平均不到 12 个字）：多半是漫画对白气泡，整个气泡算一段，不按书页的缩进规则拆
+        if median((c.y1 - c.y0) / max(c.x1 - c.x0, 1) for c in b) < 12:
+            paras.append(Paragraph(list(b), vertical=True))
+            continue
         gaps = [p.x0 - c.x1 for p, c in zip(b, b[1:])]
         g_med = median(gaps) if gaps else cw
         cur = Paragraph([b[0]], vertical=True)
@@ -394,7 +418,7 @@ def analyze(items: list[Box], pages: list[tuple[int, int, int, int]] | None = No
     for g in groups:
         # 竖排为主（日文书籍、报纸等）：竖排的列按竖排规则排序分段，横排的标题、页码照常处理
         vert = [it for it in g if _is_vertical(it)]
-        if len(vert) >= max(2, 0.5 * len(g)):
+        if len(vert) >= 2:
             horiz = [it for it in g if not _is_vertical(it)]
             v_paras = _vertical_paragraphs(vert)
             h_paras: list[Paragraph] = []
@@ -402,9 +426,14 @@ def analyze(items: list[Box], pages: list[tuple[int, int, int, int]] | None = No
                 hu = median(it[3] - it[1] for it in horiz)
                 for block in _order_blocks(_link_blocks(_split_rows(horiz, hu), hu), hu):
                     h_paras.extend(_paragraphs(sorted(block, key=lambda l_: l_.y0)))
-            v_top = min(it[1] for it in vert)
-            page_paras = ([p for p in h_paras if p.bbox[3] <= v_top] + v_paras  # 竖排正文上方的横排标题放前面
-                          + [p for p in h_paras if p.bbox[3] > v_top])
+            if len(vert) >= 0.5 * len(g) and all(len(p.lines) >= 3 for p in v_paras[:1]) and                     max((len(p.lines) for p in v_paras), default=0) >= 6:
+                # 竖排书页：横排标题、页码按位置放在竖排正文前后
+                v_top = min(it[1] for it in vert)
+                page_paras = ([p for p in h_paras if p.bbox[3] <= v_top] + v_paras
+                              + [p for p in h_paras if p.bbox[3] > v_top])
+            else:
+                # 漫画等竖横混排：一层层从上往下，每层从右往左
+                page_paras = _order_by_bands(v_paras + h_paras, right_to_left=True)
             if paras and page_paras and len(groups) > 1 and _continues(paras[-1], page_paras[0]):
                 paras[-1].lines.extend(page_paras.pop(0).lines)
             paras.extend(page_paras)
@@ -425,3 +454,22 @@ def to_text(paras: list[Paragraph], keep_line_breaks: bool = False) -> str:
         return "\n\n".join(p.override if p.override is not None else "\n".join(ln.text for ln in p.lines)
                              for p in paras)
     return "\n".join(p.text for p in paras)
+
+
+# ------------------------------------------------------------------ 日文字形
+# 识别模型是中日文混合训练的，日文里的汉字常被认成简体字（数値→数值、対→对）。
+# 只收简体专用、日文不用的字形（叶、机、据 日文也用，不收），换回日文新字体；只在含假名的段落里替换。
+_JP_FORMS = str.maketrans(
+    "值对说语时发实际变关问题动读应经济气东车门见长书图电话认识设计记译转输选择显处务业产个开间场后进还过运边结构极线级纸红绿细终给统续编练现样头买卖华单历压广无员园报乐层岁带归战杂权欢汉测热爱环确离种积简类组绍维网罗职脑节药获虑览规视订讨训论证评调谈负费资质购软载较辑达违连迟适钱铁错键闭闻阅阶难预领频风飞饭马鱼鸟龙齐观觉艺项顺须页缩继绝总恶惯态怀忆举义习乡亚仅众优传价侧债儿军农决况净减击则刚创别剧劝劳势协卫厅县听启响团围圣坏块坚坛备夺奋妇宫宽寻导尔岛币师庆库废异张弹强录彻惊户执扩扫护拟损换挥敌晓暂术杀标树桥检毕污沟泽洁浓涂渐满灭灵炼烟烦牵犹疗盖盐监码础祸稳穷竞笔粮紧纪约纳纯织络绩缘缓罚肃肠肤胁胜脏舰苏范荐荣虽补让议讲许访诉词试诗诚该详误请课谁谢谓谱贝贡财责败货贩贫贯贵贸贺赏赖赞跃轨轮轻辅辈迁递逻遗邮邻释针钢银锁镜队阳阴阵陆陈险隐雾韩顶顾顿颜额饮馆驱验骑鲜齿龄",
+    "値対説語時発実際変関問題動読応経済気東車門見長書図電話認識設計記訳転輸選択顕処務業産個開間場後進還過運辺結構極線級紙紅緑細終給統続編練現様頭買売華単歴圧広無員園報楽層歳帯帰戦雑権歓漢測熱愛環確離種積簡類組紹維網羅職脳節薬獲慮覧規視訂討訓論証評調談負費資質購軟載較輯達違連遅適銭鉄錯鍵閉聞閲階難預領頻風飛飯馬魚鳥竜斉観覚芸項順須頁縮継絶総悪慣態懐憶挙義習郷亜僅衆優伝価側債児軍農決況浄減撃則剛創別劇勧労勢協衛庁県聴啓響団囲聖壊塊堅壇備奪奮婦宮寛尋導爾島幣師慶庫廃異張弾強録徹驚戸執拡掃護擬損換揮敵暁暫術殺標樹橋検畢汚溝沢潔濃塗漸満滅霊錬煙煩牽猶療蓋塩監碼礎禍穏窮競筆糧緊紀約納純織絡績縁緩罰粛腸膚脅勝臓艦蘇範薦栄雖補譲議講許訪訴詞試詩誠該詳誤請課誰謝謂譜貝貢財責敗貨販貧貫貴貿賀賞頼賛躍軌輪軽輔輩遷逓邏遺郵隣釈針鋼銀鎖鏡隊陽陰陣陸陳険隠霧韓頂顧頓顔額飲館駆験騎鮮歯齢")
+_KANA = re.compile(r"[぀-ゟ゠-ヿ]")
+# 平假名“へべぺ”和片假名几乎一样，夹在片假名之间（ベース、データベース）时换成片假名
+_KATA_HE = re.compile(r"(?<=[ァ-ヺ])[へべぺ](?=[ァ-ーー])|[へべぺ](?=ー)")
+
+
+def japanese_forms(paras: list[Paragraph]) -> None:
+    """含假名（日文）的段落里，把被认成简体字的汉字换回日文字形（就地修改）。"""
+    for p in paras:
+        if p.override is None and _KANA.search(p.text):
+            for ln in p.lines:
+                ln.text = _KATA_HE.sub(lambda m: chr(ord(m.group()) + 0x60), ln.text.translate(_JP_FORMS))
