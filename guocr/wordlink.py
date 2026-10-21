@@ -345,6 +345,7 @@ def refine(paras: list[Paragraph], regions: list[tuple[int, int, int, int]], cen
                 k = prev if prev is not None else nxt
         assigned.append(k)
 
+    vertical = sum(p.vertical for p in paras) > len(paras) / 2  # 竖排文档：贴译文时也竖排
     out: list[Paragraph] = []
     for k, (a, b, text) in enumerate(pieces):
         idx = [li for li in range(len(lines)) if assigned[li] == k]
@@ -367,6 +368,6 @@ def refine(paras: list[Paragraph], regions: list[tuple[int, int, int, int]], cen
             if (a2, b2) != (a, b - 1):
                 text = build_text(a2, b2)
         if re.search(r"\w", text):  # 只有符号（如图片占位的“/”）的不算一段
-            out.append(Paragraph([lines[li] for li in idx], override=text))
+            out.append(Paragraph([lines[li] for li in idx], override=text, vertical=vertical))
     log.info("已用 Word 原文校正：%d 段（识别词与原文对齐 %d/%d）", len(out), matched, len(ocr_words))
     return out or None

@@ -176,6 +176,55 @@ def _draw_block(p: QPainter, block: list, text: str, indent_first: bool, W: int,
         p.drawText(QRectF(x, y + i * step, W - x, step), flags, row)
 
 
+_V_PUNCT = set("，。、；：！？")  # 竖排时放在字格右上角的标点
+_V_ROTATE = {"（": "︵", "）": "︶", "「": "﹁", "」": "﹂", "『": "﹃", "』": "﹄", "《": "︽", "》": "︾",
+             "—": "︱", "…": "︙", "-": "︱", "～": "≀", "(": "︵", ")": "︶"}
+
+
+def _draw_vertical(p: QPainter, cols: list, text: str, W: int, H: int) -> None:
+    """竖排译文：在原来的列区域里从上往下、从右往左写；字号取列宽，放不下就缩小，再不行就往左多占几列。"""
+    if not text:
+        return
+    bg, fg = cols[0][0], cols[0][1]
+    inks = [c[2] for c in cols]
+    widths = sorted(i[2] - i[0] for i in inks)
+    cw = max(widths[len(widths) // 2], 8)
+    top = min(i[1] for i in inks)
+    bottom = max(i[3] for i in inks)
+    right = max(i[2] for i in inks)
+    centers = sorted(((i[0] + i[2]) / 2 for i in inks), reverse=True)
+    pitch = (centers[0] - centers[-1]) / (len(centers) - 1) if len(centers) > 1 else cw * 1.6
+    chars = [ch for ch in text if not ch.isspace()]
+    font = QFont(FONT_FAMILY)
+    size = cw * 0.95
+    while True:
+        step = size * 1.05
+        per_col = max(1, int((bottom - top) // step))
+        ncols = -(-len(chars) // per_col)
+        if ncols <= len(cols) or size <= cw * 0.6:
+            break
+        size -= 0.5
+    font.setPixelSize(int(max(size, 8)))
+    fm = QFontMetricsF(font)
+    col_pitch = max(pitch * size / (cw * 0.95), size * 1.3)
+    p.setFont(font)
+    p.setPen(fg)
+    for k in range(ncols):
+        cx = (right - cw / 2) - k * col_pitch
+        if cx - size / 2 < 0:
+            break
+        if k >= len(cols):  # 原有列不够：往左多占一列，先铺背景
+            p.fillRect(QRectF(cx - col_pitch / 2, top - 2, col_pitch, bottom - top + 4), bg)
+        for j, ch in enumerate(chars[k * per_col:(k + 1) * per_col]):
+            y = top + j * step
+            if ch in _V_PUNCT:
+                p.drawText(QRectF(cx, y - size * 0.45, size * 0.6, size), Qt.AlignmentFlag.AlignLeft, ch)
+                continue
+            ch = _V_ROTATE.get(ch, ch)
+            w_ = fm.horizontalAdvance(ch)
+            p.drawText(QRectF(cx - w_ / 2, y, w_ + 2, step), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, ch)
+
+
 def render_translation(image: QImage, pairs) -> QImage:
     """把译文按段落贴回原文位置：先用背景色抹掉原文各行，再在原段落区域内重新排版译文。
 
@@ -204,6 +253,9 @@ def render_translation(image: QImage, pairs) -> QImage:
             p.fillRect(QRectF(x0 - 1, y0 - 1, x1 - x0 + 2, y1 - y0 + 2), bg)  # 抹掉原文
             styles.append((bg, fg, ink, x1))
         if not styles:
+            continue
+        if getattr(para, "vertical", False):  # 竖排原文 → 竖排译文
+            _draw_vertical(p, styles, dst, W, H)
             continue
         blocks = _blocks(styles)
         weights = [sum(max(s[3] - s[2][0], 1) for s in b) for b in blocks]

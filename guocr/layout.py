@@ -38,6 +38,7 @@ class Line:
 class Paragraph:
     lines: list[Line] = field(default_factory=list)
     override: str | None = None  # 已知准确原文（如从 Word 直接读取）时用它代替识别文字
+    vertical: bool = False       # 竖排段落：lines 为从右往左的各列
 
     @property
     def text(self) -> str:
@@ -295,6 +296,53 @@ def _paragraphs(lines: list[Line]) -> list[Paragraph]:
     return paras
 
 
+# ------------------------------------------------------------------ 竖排（日文、繁体古籍等）
+def _is_vertical(it: Box) -> bool:
+    """竖排的一列：高明显大于宽（单个字的框不算）。"""
+    w, h = it[2] - it[0], it[3] - it[1]
+    return h > 2.5 * w and len(it[4].strip()) >= 2
+
+
+def _vertical_paragraphs(items: list[Box]) -> list[Paragraph]:
+    """竖排：列从右往左、列内从上往下。相邻、上下有重叠的列连成区块；区块按“先上面一栏、栏内从右往左”排列。
+    分段：列顶端比区块顶端低约一个字（首行缩进），或上一列底端提前结束（段尾），或列间空隙明显变大。"""
+    cols = [Line(*it) for it in items]
+    cw = median(c.x1 - c.x0 for c in cols)  # 字宽约等于列宽
+    blocks: list[list[Line]] = []
+    for c in sorted(cols, key=lambda l_: -l_.x1):  # 从右往左
+        best = None
+        for b in blocks:
+            last = b[-1]
+            gap = last.x0 - c.x1
+            overlap = min(c.y1, last.y1) - max(c.y0, last.y0)
+            if -0.3 * cw <= gap <= 2.0 * cw and overlap > 0.3 * min(c.y1 - c.y0, last.y1 - last.y0):
+                best = b
+                break
+        if best is None:
+            blocks.append([c])
+        else:
+            best.append(c)
+    # 栏：上下不重叠的区块分属不同的栏，先读上面的栏；同一栏内从右往左
+    blocks.sort(key=lambda b: (round(min(c.y0 for c in b) / max(cw * 4, 1)), -max(c.x1 for c in b)))
+    paras: list[Paragraph] = []
+    for b in blocks:
+        top, bottom = min(c.y0 for c in b), max(c.y1 for c in b)
+        gaps = [p.x0 - c.x1 for p, c in zip(b, b[1:])]
+        g_med = median(gaps) if gaps else cw
+        cur = Paragraph([b[0]], vertical=True)
+        for prev, c in zip(b, b[1:]):
+            indented = c.y0 - top > 0.6 * cw and prev.y0 - top < 0.4 * cw
+            ended = bottom - prev.y1 > 1.5 * cw
+            spaced = prev.x0 - c.x1 > max(1.6 * g_med, g_med + 0.5 * cw)
+            if indented or ended or spaced:
+                paras.append(cur)
+                cur = Paragraph([c], vertical=True)
+            else:
+                cur.lines.append(c)
+        paras.append(cur)
+    return paras
+
+
 def _order_pages(pages: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
     """页面按阅读顺序排列：先按行（上下重叠的算同一行）从上到下，行内从左到右。"""
     rows: list[list] = []
@@ -344,6 +392,23 @@ def analyze(items: list[Box], pages: list[tuple[int, int, int, int]] | None = No
         groups = [g for g in groups if g] + ([rest] if rest else [])
     paras: list[Paragraph] = []
     for g in groups:
+        # 竖排为主（日文书籍、报纸等）：竖排的列按竖排规则排序分段，横排的标题、页码照常处理
+        vert = [it for it in g if _is_vertical(it)]
+        if len(vert) >= max(2, 0.5 * len(g)):
+            horiz = [it for it in g if not _is_vertical(it)]
+            v_paras = _vertical_paragraphs(vert)
+            h_paras: list[Paragraph] = []
+            if horiz:
+                hu = median(it[3] - it[1] for it in horiz)
+                for block in _order_blocks(_link_blocks(_split_rows(horiz, hu), hu), hu):
+                    h_paras.extend(_paragraphs(sorted(block, key=lambda l_: l_.y0)))
+            v_top = min(it[1] for it in vert)
+            page_paras = ([p for p in h_paras if p.bbox[3] <= v_top] + v_paras  # 竖排正文上方的横排标题放前面
+                          + [p for p in h_paras if p.bbox[3] > v_top])
+            if paras and page_paras and len(groups) > 1 and _continues(paras[-1], page_paras[0]):
+                paras[-1].lines.extend(page_paras.pop(0).lines)
+            paras.extend(page_paras)
+            continue
         # 分区：行片段 → 区块 → 阅读顺序；每个区块内再分段
         page_paras: list[Paragraph] = []
         for block in _order_blocks(_link_blocks(_split_rows(g, unit), unit), unit):
